@@ -15,12 +15,12 @@ import StringIO
 import csv
 import json
 import os
+import re
 import urllib
 import zlib
-
-from time import strftime, gmtime
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from time import strftime, gmtime
 
 import boto3
 import botocore
@@ -32,7 +32,7 @@ __version__ = '1.0'
 
 # Get Lambda environment variables
 region = os.environ['REGION']
-max_threads = os.environ['MAX_THREADS']
+max_threads = int(os.environ['MAX_THREADS'])
 text_message_file = os.environ['TEXT_MESSAGE_FILE']
 html_message_file = os.environ['HTML_MESSAGE_FILE']
 
@@ -42,6 +42,9 @@ ses = boto3.client('ses', region_name=region)
 send_errors = []
 mime_message_text = ''
 mime_message_html = ''
+num_messages_sent = 0
+num_messages_skipped = 0
+hashes_of_messages_sent = []
 
 
 def current_time():
@@ -61,38 +64,65 @@ def mime_email(subject, from_address, to_address, text_message=None, html_messag
     return msg.as_string()
 
 
-def send_mail(from_address, to_address, message):
+def send_mail(from_address, to_address, message, subject):
     global send_errors
-    try:
-        response = ses.send_raw_email(
-            Source=from_address,
-            Destinations=[
-                to_address,
-            ],
-            RawMessage={
-                'Data': message
-            }
-        )
-        if not isinstance(response, dict):  # log failed requests only
-            send_errors.append('%s, %s, %s' % (current_time(), to_address, response))
-    except botocore.exceptions.ClientError as e:
-        send_errors.append('%s, %s, %s, %s' %
-                           (current_time(),
-                               to_address,
-                               ', '.join("%s=%r" % (k, v) for (k, v) in e.response['ResponseMetadata'].iteritems()),
-                               e.message))
+    global num_messages_sent
+    global num_messages_skipped
+    global hashes_of_messages_sent
+
+    if not re.match(r"(^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$)", to_address):
+        send_errors.append('"%s" is an invalid address' % to_address)
+        return
+
+    this_message_hash = hash((from_address.lower(), to_address.lower(), subject))
+
+    if this_message_hash not in hashes_of_messages_sent:
+        # we haven't already sent this message.  send it.
+        try:
+            response = ses.send_raw_email(
+                Source=from_address,
+                Destinations=[
+                    to_address,
+                ],
+                RawMessage={
+                    'Data': message
+                }
+            )
+            if not isinstance(response, dict):  # log failed requests only
+                send_errors.append('%s, %s, %s' % (current_time(), to_address, response))
+            else:
+                print('> %s' % to_address)
+                num_messages_sent += 1
+                hashes_of_messages_sent.append(this_message_hash)
+        except botocore.exceptions.ClientError as e:
+            send_errors.append('%s, %s, %s, %s' %
+                               (current_time(),
+                                to_address,
+                                ', '.join("%s=%r" % (k, v) for (k, v) in e.response['ResponseMetadata'].iteritems()),
+                                e.message))
+    else:
+        # message was already sent, possibly as a result of a Lambda retry.  skip it this time.
+        num_messages_skipped += 1
 
 
 def lambda_handler(event, context):
     global send_errors
     global mime_message_text
     global mime_message_html
+    global num_messages_sent
+    global num_messages_skipped
+    global hashes_of_messages_sent
+
+    # reset state
+    num_messages_sent = 0
+    num_messages_skipped = 0
+
     try:
         # Read the uploaded csv file from the bucket into python dictionary list
         bucket = event['Records'][0]['s3']['bucket']['name']
         key = urllib.unquote_plus(event['Records'][0]['s3']['object']['key']).decode('utf8')
         response = s3.get_object(Bucket=bucket, Key=key)
-        body = zlib.decompress(response['Body'].read(), 16+zlib.MAX_WBITS)
+        body = zlib.decompress(response['Body'].read(), 16 + zlib.MAX_WBITS)
         reader = csv.DictReader(StringIO.StringIO(body),
                                 fieldnames=['from_address', 'to_address', 'subject', 'message'])
 
@@ -115,40 +145,57 @@ def lambda_handler(event, context):
 
         # Send in parallel using several threads
         e = concurrent.futures.ThreadPoolExecutor(max_workers=max_threads)
+        print('Using %d threads ...' % max_threads)
+
         for row in reader:
             from_address = row['from_address'].strip()
             to_address = row['to_address'].strip()
             subject = row['subject'].strip()
             message = mime_email(subject, from_address, to_address, mime_message_text, mime_message_html)
-            e.submit(send_mail, from_address, to_address, message)
+            if max_threads > 1:
+                e.submit(send_mail, from_address, to_address, message, subject)
+            else:
+                send_mail(from_address, to_address, message, subject)
         e.shutdown()
-    except Exception as e:
-        print(e.message + ' Aborting...')
-        raise e
 
-    print('Send email complete.')
+        print('Send email complete.')
+        print('%d emails sent.' % num_messages_sent)
+        print('%d emails skipped.' % num_messages_skipped)
 
-    # Remove the uploaded csv file
-    try:
-        response = s3.delete_object(Bucket=bucket, Key=key)
-        if 'ResponseMetadata' in response.keys() and response['ResponseMetadata']['HTTPStatusCode'] == 204:
-            print('Removed s3://%s/%s' % (bucket, key))
-    except Exception as e:
-        print(e)
-
-    # Upload errors if any to S3
-    if len(send_errors) > 0:
+        # Remove the uploaded csv file
         try:
-            result_data = '\n'.join(send_errors)
-            logfile_key = key.replace('.csv.gz', '') + '_error.log'
-            response = s3.put_object(Bucket=bucket, Key=logfile_key, Body=result_data)
-            if 'ResponseMetadata' in response.keys() and response['ResponseMetadata']['HTTPStatusCode'] == 200:
-                print('Send email errors saved in s3://%s/%s' % (bucket, logfile_key))
-        except Exception as e:
-            print(e)
-            raise e
-        # Reset publish error log
-        send_errors = []
+            response = s3.delete_object(Bucket=bucket, Key=key)
+            if 'ResponseMetadata' in response.keys() and response['ResponseMetadata']['HTTPStatusCode'] == 204:
+                print('Removed s3://%s/%s' % (bucket, key))
+        except Exception as ex:
+            print(ex)
+        # Remove the uploaded html_message_file
+        try:
+            response = s3.delete_object(Bucket=bucket, Key=html_message_file)
+            if 'ResponseMetadata' in response.keys() and response['ResponseMetadata']['HTTPStatusCode'] == 204:
+                print('Removed s3://%s/%s' % (bucket, html_message_file))
+        except Exception as ex:
+            print(ex)
+        # Remove the uploaded text_message_file
+        try:
+            response = s3.delete_object(Bucket=bucket, Key=text_message_file)
+            if 'ResponseMetadata' in response.keys() and response['ResponseMetadata']['HTTPStatusCode'] == 204:
+                print('Removed s3://%s/%s' % (bucket, text_message_file))
+        except Exception as ex:
+            print(ex)
+
+        # Print any errors at bottom of log
+        if len(send_errors) > 0:
+            for send_error in send_errors:
+                print('ERROR: %s' % send_error)
+            # Reset publish error log
+            send_errors = []
+
+    except Exception as ex:
+        print('Encountered exception...')
+        print(ex)
+        print('%d emails sent.' % num_messages_sent)
+        print('%d emails skipped.' % num_messages_skipped)
 
 
 if __name__ == "__main__":
